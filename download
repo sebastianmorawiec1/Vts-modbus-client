@@ -1,0 +1,129 @@
+"""Testy jednostkowe vts_modbus.client — z mockiem pymodbus (bez realnego urządzenia)."""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from vts_modbus.client import VTSModbusClient
+from vts_modbus.config import DeviceConfig
+from vts_modbus.exceptions import (
+    VTSConnectionError,
+    VTSRegisterNotFoundError,
+    VTSReadError,
+    VTSWriteError,
+)
+from vts_modbus.registers import RegisterDefinition
+
+
+@pytest.fixture
+def device_cfg():
+    return DeviceConfig(host="127.0.0.1", port=502, unit_id=1)
+
+
+@pytest.fixture
+def registers():
+    return {
+        "temp_nawiew": RegisterDefinition(
+            name="temp_nawiew",
+            address=0,
+            table="holding",
+            data_type="int16",
+            scale=0.1,
+            access="read",
+        ),
+        "tryb_pracy": RegisterDefinition(
+            name="tryb_pracy",
+            address=20,
+            table="holding",
+            data_type="uint16",
+            access="read_write",
+        ),
+        "status_pracy": RegisterDefinition(
+            name="status_pracy",
+            address=30,
+            table="coil",
+            access="read",
+        ),
+    }
+
+
+def _make_read_result(registers_values):
+    result = MagicMock()
+    result.isError.return_value = False
+    result.registers = registers_values
+    return result
+
+
+def test_read_decodes_scaled_int16(device_cfg, registers):
+    client = VTSModbusClient(device_cfg, registers)
+    mock_pymodbus = MagicMock()
+    mock_pymodbus.connect.return_value = True
+    mock_pymodbus.read_holding_registers.return_value = _make_read_result([215])
+
+    with patch("vts_modbus.client.ModbusTcpClient", return_value=mock_pymodbus):
+        client.connect()
+        value = client.read("temp_nawiew")
+
+    assert value == pytest.approx(21.5)
+    mock_pymodbus.read_holding_registers.assert_called_once_with(0, count=1, slave=1)
+
+
+def test_connect_failure_raises(device_cfg, registers):
+    client = VTSModbusClient(device_cfg, registers)
+    mock_pymodbus = MagicMock()
+    mock_pymodbus.connect.return_value = False
+
+    with patch("vts_modbus.client.ModbusTcpClient", return_value=mock_pymodbus):
+        with pytest.raises(VTSConnectionError):
+            client.connect()
+
+
+def test_read_unknown_register_raises(device_cfg, registers):
+    client = VTSModbusClient(device_cfg, registers)
+    mock_pymodbus = MagicMock()
+    mock_pymodbus.connect.return_value = True
+
+    with patch("vts_modbus.client.ModbusTcpClient", return_value=mock_pymodbus):
+        client.connect()
+        with pytest.raises(VTSRegisterNotFoundError):
+            client.read("nieistniejacy_rejestr")
+
+
+def test_write_to_read_only_register_raises(device_cfg, registers):
+    client = VTSModbusClient(device_cfg, registers)
+    mock_pymodbus = MagicMock()
+    mock_pymodbus.connect.return_value = True
+
+    with patch("vts_modbus.client.ModbusTcpClient", return_value=mock_pymodbus):
+        client.connect()
+        with pytest.raises(VTSWriteError):
+            client.write("temp_nawiew", 22.0)
+
+
+def test_write_holding_register(device_cfg, registers):
+    client = VTSModbusClient(device_cfg, registers)
+    mock_pymodbus = MagicMock()
+    mock_pymodbus.connect.return_value = True
+    write_result = MagicMock()
+    write_result.isError.return_value = False
+    mock_pymodbus.write_register.return_value = write_result
+
+    with patch("vts_modbus.client.ModbusTcpClient", return_value=mock_pymodbus):
+        client.connect()
+        client.write("tryb_pracy", 2)
+
+    mock_pymodbus.write_register.assert_called_once_with(20, 2, slave=1)
+
+
+def test_read_error_from_device_raises(device_cfg, registers):
+    client = VTSModbusClient(device_cfg, registers)
+    mock_pymodbus = MagicMock()
+    mock_pymodbus.connect.return_value = True
+    error_result = MagicMock()
+    error_result.isError.return_value = True
+    mock_pymodbus.read_holding_registers.return_value = error_result
+
+    with patch("vts_modbus.client.ModbusTcpClient", return_value=mock_pymodbus):
+        client.connect()
+        with pytest.raises(VTSReadError):
+            client.read("temp_nawiew")

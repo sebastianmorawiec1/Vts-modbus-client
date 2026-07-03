@@ -1,0 +1,8 @@
+# Konfiguracja połączenia Modbus TCP/IP z centralą VTS
+# Dostosuj adres IP, port i unit_id do swojego urządzenia / bramki Modbus.
+
+host: 192.168.1.50
+port: 502
+unit_id: 1       # adres slave (ID urządzenia Modbus), zwykle 1
+timeout: 3        # sekundy oczekiwania na odpowiedź
+retries: 3
