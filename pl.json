@@ -8,16 +8,21 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT, Platform
 from homeassistant.core import HomeAssistant
 
+from pathlib import Path
+
 from .const import (
     CONF_REGISTERS_FILE,
     CONF_SCAN_INTERVAL,
     CONF_UNIT_ID,
-    DEFAULT_REGISTERS,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
 )
 from .coordinator import VTSModbusCoordinator
-from .registers import build_default_registers, load_registers_from_yaml
+from .registers import load_registers_from_yaml
+
+# Domyślna mapa rejestrów: pełna mapa z oficjalnej dokumentacji VTS dla
+# modułu rozszerzeń Carel TCP/IP (sterowniki VS...uPC), dołączona do integracji.
+BUNDLED_REGISTERS_FILE = Path(__file__).parent / "registers_vts_carel_tcpip.yaml"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,11 +37,8 @@ PLATFORMS: list[Platform] = [
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     data = entry.data
 
-    registers_file = data.get(CONF_REGISTERS_FILE)
-    if registers_file:
-        registers = await hass.async_add_executor_job(load_registers_from_yaml, registers_file)
-    else:
-        registers = build_default_registers(DEFAULT_REGISTERS)
+    registers_file = data.get(CONF_REGISTERS_FILE) or str(BUNDLED_REGISTERS_FILE)
+    registers = await hass.async_add_executor_job(load_registers_from_yaml, registers_file)
 
     coordinator = VTSModbusCoordinator(
         hass,

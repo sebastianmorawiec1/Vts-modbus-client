@@ -21,7 +21,7 @@ async def async_setup_entry(
     entities = [
         VTSSensor(coordinator, entry, name)
         for name, reg in coordinator.registers.items()
-        if reg.table in ("holding", "input") and reg.is_readable
+        if reg.table in ("holding", "input") and reg.access == "read"
     ]
     async_add_entities(entities)
 

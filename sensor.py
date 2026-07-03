@@ -1,102 +1,122 @@
-"""Config flow dla integracji VTS Modbus."""
+"""Coordinator odpowiadający za cykliczny odczyt i zapis rejestrów Modbus."""
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from datetime import timedelta
+from typing import Any, Dict
 
-import voluptuous as vol
-
-from homeassistant import config_entries
-from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import (
-    CONF_REGISTERS_FILE,
-    CONF_SCAN_INTERVAL,
-    CONF_UNIT_ID,
-    DEFAULT_PORT,
-    DEFAULT_REGISTERS,
-    DEFAULT_SCAN_INTERVAL,
-    DEFAULT_UNIT_ID,
-    DOMAIN,
-)
-from .registers import build_default_registers, load_registers_from_yaml
+from .registers import RegisterDefinition
 
 _LOGGER = logging.getLogger(__name__)
 
-STEP_USER_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_HOST): str,
-        vol.Required(CONF_PORT, default=DEFAULT_PORT): int,
-        vol.Required(CONF_UNIT_ID, default=DEFAULT_UNIT_ID): int,
-        vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): int,
-        vol.Optional(CONF_REGISTERS_FILE): str,
-    }
-)
 
+class VTSModbusCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
+    """Odpytuje centralę VTS po Modbus TCP/IP i udostępnia dane encjom."""
 
-async def _validate_input(hass: HomeAssistant, data: Dict[str, Any]) -> None:
-    """Sprawdza połączenie TCP oraz (opcjonalnie) poprawność pliku rejestrów."""
-    from pymodbus.client import ModbusTcpClient
-
-    registers_file: Optional[str] = data.get(CONF_REGISTERS_FILE)
-    if registers_file:
-        try:
-            registers = await hass.async_add_executor_job(load_registers_from_yaml, registers_file)
-        except Exception as exc:  # noqa: BLE001
-            raise InvalidRegistersFile from exc
-        if not registers:
-            raise InvalidRegistersFile
-
-    def _test_connection() -> bool:
-        client = ModbusTcpClient(host=data[CONF_HOST], port=data[CONF_PORT], timeout=5)
-        ok = client.connect()
-        client.close()
-        return ok
-
-    connected = await hass.async_add_executor_job(_test_connection)
-    if not connected:
-        raise CannotConnect
-
-
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Config flow VTS Modbus."""
-
-    VERSION = 1
-
-    async def async_step_user(self, user_input: Optional[Dict[str, Any]] = None):
-        errors: Dict[str, str] = {}
-
-        if user_input is not None:
-            unique_id = f"{user_input[CONF_HOST]}:{user_input[CONF_PORT]}:{user_input[CONF_UNIT_ID]}"
-            await self.async_set_unique_id(unique_id)
-            self._abort_if_unique_id_configured()
-
-            try:
-                await _validate_input(self.hass, user_input)
-            except CannotConnect:
-                errors["base"] = "cannot_connect"
-            except InvalidRegistersFile:
-                errors["base"] = "invalid_registers_file"
-            except Exception:  # noqa: BLE001
-                _LOGGER.exception("Nieoczekiwany błąd walidacji")
-                errors["base"] = "unknown"
-            else:
-                return self.async_create_entry(
-                    title=f"Centrala VTS ({user_input[CONF_HOST]})",
-                    data=user_input,
-                )
-
-        return self.async_show_form(
-            step_id="user", data_schema=STEP_USER_SCHEMA, errors=errors
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        host: str,
+        port: int,
+        unit_id: int,
+        registers: Dict[str, RegisterDefinition],
+        scan_interval: int,
+    ) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            name="VTS Modbus",
+            update_interval=timedelta(seconds=scan_interval),
         )
+        self.host = host
+        self.port = port
+        self.unit_id = unit_id
+        self.registers = registers
+        self._client = None
 
+    def _get_client(self):
+        from pymodbus.client import ModbusTcpClient
 
-class CannotConnect(HomeAssistantError):
-    """Błąd sygnalizujący brak połączenia z urządzeniem."""
+        if self._client is None:
+            self._client = ModbusTcpClient(host=self.host, port=self.port, timeout=5)
+        if not self._client.is_socket_open():
+            if not self._client.connect():
+                raise ConnectionError(f"Nie udało się połączyć z {self.host}:{self.port}")
+        return self._client
 
+    # -- odczyt cykliczny (wywoływane przez DataUpdateCoordinator) --------
+    async def _async_update_data(self) -> Dict[str, Any]:
+        try:
+            return await self.hass.async_add_executor_job(self._read_all_sync)
+        except Exception as exc:  # noqa: BLE001
+            raise UpdateFailed(f"Błąd komunikacji z centralą VTS: {exc}") from exc
 
-class InvalidRegistersFile(HomeAssistantError):
-    """Błąd sygnalizujący niepoprawny plik z mapą rejestrów."""
+    def _read_all_sync(self) -> Dict[str, Any]:
+        client = self._get_client()
+        values: Dict[str, Any] = {}
+
+        for name, reg in self.registers.items():
+            if not reg.is_readable:
+                continue
+            try:
+                values[name] = self._read_register_sync(client, reg)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("Nie udało się odczytać rejestru '%s': %s", name, exc)
+                values[name] = None
+
+        return values
+
+    def _read_register_sync(self, client, reg: RegisterDefinition) -> Any:
+        unit = self.unit_id
+        if reg.table == "holding":
+            result = client.read_holding_registers(reg.address, count=reg.register_count, slave=unit)
+        elif reg.table == "input":
+            result = client.read_input_registers(reg.address, count=reg.register_count, slave=unit)
+        elif reg.table == "coil":
+            result = client.read_coils(reg.address, count=1, slave=unit)
+        elif reg.table == "discrete_input":
+            result = client.read_discrete_inputs(reg.address, count=1, slave=unit)
+        else:
+            raise ValueError(f"Nieobsługiwana tabela: {reg.table}")
+
+        if result.isError():
+            raise IOError(f"Urządzenie zwróciło błąd: {result}")
+
+        if reg.table in ("coil", "discrete_input"):
+            return bool(result.bits[0])
+        return reg.decode(result.registers)
+
+    # -- zapis (wywoływane przez encje number/switch) ----------------------
+    async def async_write_register(self, name: str, value: Any) -> None:
+        reg = self.registers[name]
+        if not reg.is_writable:
+            raise PermissionError(f"Rejestr '{name}' jest tylko do odczytu")
+
+        await self.hass.async_add_executor_job(self._write_register_sync, reg, value)
+        await self.async_request_refresh()
+
+    def _write_register_sync(self, reg: RegisterDefinition, value: Any) -> None:
+        client = self._get_client()
+        unit = self.unit_id
+
+        if reg.table == "coil":
+            result = client.write_coil(reg.address, bool(value), slave=unit)
+        elif reg.table == "holding":
+            words = reg.encode(value)
+            if len(words) == 1:
+                result = client.write_register(reg.address, words[0], slave=unit)
+            else:
+                result = client.write_registers(reg.address, words, slave=unit)
+        else:
+            raise ValueError(f"Zapis do tabeli '{reg.table}' nie jest obsługiwany")
+
+        if result.isError():
+            raise IOError(f"Urządzenie zwróciło błąd przy zapisie: {result}")
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()

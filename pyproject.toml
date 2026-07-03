@@ -1,165 +1,89 @@
 """
-Klient Modbus TCP/IP do komunikacji z urządzeniami VTS.
+Definicje rejestrów Modbus oraz logika kodowania/dekodowania wartości.
 
-Oparty o bibliotekę `pymodbus` (>=3.6). Pozwala odczytywać i zapisywać
-parametry centrali po nazwie zdefiniowanej w mapie rejestrów, zamiast
-operować bezpośrednio na surowych adresach.
+Adresy i typy rejestrów są specyficzne dla modelu centrali VTS i sterownika –
+wartości podane w config/registers_example.yaml są PRZYKŁADOWE i wymagają
+weryfikacji z dokumentacją Modbus producenta.
 """
 
-import logging
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Literal
 
-from pymodbus.client import ModbusTcpClient
-from pymodbus.exceptions import ModbusException
-
-from .config import DeviceConfig
-from .exceptions import (
-    VTSConnectionError,
-    VTSRegisterNotFoundError,
-    VTSReadError,
-    VTSWriteError,
-)
-from .registers import RegisterDefinition
-
-logger = logging.getLogger(__name__)
+TableType = Literal["holding", "input", "coil", "discrete_input"]
+DataType = Literal["uint16", "int16", "uint32", "int32", "bitmask"]
+AccessType = Literal["read", "write", "read_write"]
 
 
-class VTSModbusClient:
-    """Klient wysokopoziomowy do komunikacji z centralą VTS po Modbus TCP/IP."""
-
-    def __init__(
-        self,
-        device_config: DeviceConfig,
-        registers: Dict[str, RegisterDefinition],
-    ):
-        self.device_config = device_config
-        self.registers = registers
-        self._client: Optional[ModbusTcpClient] = None
-
-    # -- context manager -----------------------------------------------
-    def __enter__(self) -> "VTSModbusClient":
-        self.connect()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.disconnect()
-
-    # -- połączenie -------------------------------------------------------
-    def connect(self) -> None:
-        self._client = ModbusTcpClient(
-            host=self.device_config.host,
-            port=self.device_config.port,
-            timeout=self.device_config.timeout,
-        )
-        ok = self._client.connect()
-        if not ok:
-            raise VTSConnectionError(
-                f"Nie udało się połączyć z {self.device_config.host}:"
-                f"{self.device_config.port}"
-            )
-        logger.info(
-            "Połączono z centralą VTS %s:%s (unit_id=%s)",
-            self.device_config.host,
-            self.device_config.port,
-            self.device_config.unit_id,
-        )
-
-    def disconnect(self) -> None:
-        if self._client is not None:
-            self._client.close()
-            logger.info("Rozłączono z centralą VTS")
+@dataclass
+class RegisterDefinition:
+    name: str
+    address: int
+    table: TableType = "holding"
+    data_type: DataType = "uint16"
+    scale: float = 1.0
+    unit: str = ""
+    access: AccessType = "read"
+    description: str = ""
 
     @property
-    def is_connected(self) -> bool:
-        return bool(self._client and self._client.is_socket_open())
+    def register_count(self) -> int:
+        """Ile 16-bitowych rejestrów zajmuje ta wartość."""
+        return 2 if self.data_type in ("uint32", "int32") else 1
 
-    # -- odczyt / zapis pojedynczego parametru ---------------------------
-    def read(self, name: str):
-        reg = self._get_register(name)
-        if reg.access == "write":
-            raise VTSReadError(f"Rejestr '{name}' jest tylko do zapisu")
+    @classmethod
+    def from_dict(cls, name: str, data: Dict[str, Any]) -> "RegisterDefinition":
+        return cls(
+            name=name,
+            address=int(data["address"]),
+            table=data.get("table", "holding"),
+            data_type=data.get("data_type", "uint16"),
+            scale=float(data.get("scale", 1.0)),
+            unit=data.get("unit", ""),
+            access=data.get("access", "read"),
+            description=data.get("description", ""),
+        )
 
-        try:
-            raw = self._read_raw(reg)
-        except ModbusException as exc:
-            raise VTSReadError(f"Błąd odczytu rejestru '{name}': {exc}") from exc
+    def decode(self, raw_registers) -> Any:
+        """Dekoduje surowe słowa (16-bit) na wartość Pythona."""
+        if self.data_type == "uint16":
+            value = raw_registers[0]
+        elif self.data_type == "int16":
+            value = raw_registers[0]
+            if value >= 0x8000:
+                value -= 0x10000
+        elif self.data_type in ("uint32", "int32"):
+            # big-endian word order (high, low) — zweryfikuj wg dokumentacji
+            high, low = raw_registers[0], raw_registers[1]
+            value = (high << 16) | low
+            if self.data_type == "int32" and value >= 0x80000000:
+                value -= 0x100000000
+        elif self.data_type == "bitmask":
+            return raw_registers[0]  # zwracamy surową maskę bitową
+        else:
+            raise ValueError(f"Nieobsługiwany data_type: {self.data_type}")
 
-        if raw.isError():
-            raise VTSReadError(f"Urządzenie zwróciło błąd dla rejestru '{name}': {raw}")
+        if self.scale != 1.0:
+            value = round(value * self.scale, 6)
+        return value
 
-        if reg.table in ("coil", "discrete_input"):
-            return raw.bits[0]
+    def encode(self, value: Any):
+        """Koduje wartość Pythona na listę słów (16-bit) do zapisu."""
+        if self.scale != 1.0:
+            value = int(round(value / self.scale))
+        else:
+            value = int(value)
 
-        return reg.decode(raw.registers)
+        if self.data_type in ("uint16", "bitmask"):
+            return [value & 0xFFFF]
+        if self.data_type == "int16":
+            if value < 0:
+                value += 0x10000
+            return [value & 0xFFFF]
+        if self.data_type in ("uint32", "int32"):
+            if value < 0:
+                value += 0x100000000
+            high = (value >> 16) & 0xFFFF
+            low = value & 0xFFFF
+            return [high, low]
 
-    def write(self, name: str, value: Any) -> None:
-        reg = self._get_register(name)
-        if reg.access == "read":
-            raise VTSWriteError(f"Rejestr '{name}' jest tylko do odczytu")
-
-        assert self._client is not None, "Klient nie jest połączony — wywołaj connect()"
-
-        try:
-            if reg.table == "coil":
-                result = self._client.write_coil(
-                    reg.address, bool(value), slave=self.device_config.unit_id
-                )
-            elif reg.table == "holding":
-                words = reg.encode(value)
-                if len(words) == 1:
-                    result = self._client.write_register(
-                        reg.address, words[0], slave=self.device_config.unit_id
-                    )
-                else:
-                    result = self._client.write_registers(
-                        reg.address, words, slave=self.device_config.unit_id
-                    )
-            else:
-                raise VTSWriteError(
-                    f"Zapis do tabeli '{reg.table}' nie jest obsługiwany "
-                    f"(rejestr '{name}')"
-                )
-        except ModbusException as exc:
-            raise VTSWriteError(f"Błąd zapisu rejestru '{name}': {exc}") from exc
-
-        if result.isError():
-            raise VTSWriteError(f"Urządzenie zwróciło błąd przy zapisie '{name}': {result}")
-
-    # -- odczyt wielu parametrów naraz -----------------------------------
-    def read_all(self) -> Dict[str, Any]:
-        """Odczytuje wszystkie rejestry z mapy, które mają dostęp read/read_write."""
-        values: Dict[str, Any] = {}
-        for name, reg in self.registers.items():
-            if reg.access == "write":
-                continue
-            try:
-                values[name] = self.read(name)
-            except VTSReadError as exc:
-                logger.warning("Pominięto rejestr '%s': %s", name, exc)
-                values[name] = None
-        return values
-
-    # -- wewnętrzne -------------------------------------------------------
-    def _get_register(self, name: str) -> RegisterDefinition:
-        if name not in self.registers:
-            raise VTSRegisterNotFoundError(f"Nieznany rejestr: '{name}'")
-        return self.registers[name]
-
-    def _read_raw(self, reg: RegisterDefinition):
-        assert self._client is not None, "Klient nie jest połączony — wywołaj connect()"
-
-        unit = self.device_config.unit_id
-        if reg.table == "holding":
-            return self._client.read_holding_registers(
-                reg.address, count=reg.register_count, slave=unit
-            )
-        if reg.table == "input":
-            return self._client.read_input_registers(
-                reg.address, count=reg.register_count, slave=unit
-            )
-        if reg.table == "coil":
-            return self._client.read_coils(reg.address, count=1, slave=unit)
-        if reg.table == "discrete_input":
-            return self._client.read_discrete_inputs(reg.address, count=1, slave=unit)
-
-        raise VTSReadError(f"Nieobsługiwana tabela rejestrów: {reg.table}")
+        raise ValueError(f"Nieobsługiwany data_type: {self.data_type}")
