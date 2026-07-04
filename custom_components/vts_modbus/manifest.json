@@ -1,0 +1,12 @@
+{
+  "domain": "vts_modbus",
+  "name": "VTS Modbus",
+  "codeowners": ["@sebastianmorawiec1"],
+  "config_flow": true,
+  "documentation": "https://github.com/sebastianmorawiec1/Vts-modbus-client",
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/sebastianmorawiec1/Vts-modbus-client/issues",
+  "requirements": ["pymodbus>=3.6,<4", "PyYAML>=6.0"],
+  "version": "0.2.0"
+}
