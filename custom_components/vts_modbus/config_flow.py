@@ -12,7 +12,9 @@ from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
+from .vts_code import InvalidAppCode, decode_app_code
 from .const import (
+    CONF_APP_CODE,
     CONF_REGISTERS_FILE,
     CONF_SCAN_INTERVAL,
     CONF_UNIT_ID,
@@ -32,6 +34,7 @@ STEP_USER_SCHEMA = vol.Schema(
         vol.Required(CONF_UNIT_ID, default=DEFAULT_UNIT_ID): int,
         vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): int,
         vol.Optional(CONF_REGISTERS_FILE): str,
+        vol.Optional(CONF_APP_CODE): str,
     }
 )
 
@@ -39,6 +42,13 @@ STEP_USER_SCHEMA = vol.Schema(
 async def _validate_input(hass: HomeAssistant, data: Dict[str, Any]) -> None:
     """Sprawdza połączenie TCP oraz (opcjonalnie) poprawność pliku rejestrów."""
     from pymodbus.client import ModbusTcpClient
+
+    app_code: Optional[str] = data.get(CONF_APP_CODE)
+    if app_code:
+        try:
+            decode_app_code(app_code)
+        except InvalidAppCode as exc:
+            raise InvalidAppCodeError from exc
 
     registers_file: Optional[str] = data.get(CONF_REGISTERS_FILE)
     if registers_file:
@@ -79,6 +89,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "cannot_connect"
             except InvalidRegistersFile:
                 errors["base"] = "invalid_registers_file"
+            except InvalidAppCodeError:
+                errors["base"] = "invalid_app_code"
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Nieoczekiwany błąd walidacji")
                 errors["base"] = "unknown"
@@ -99,3 +111,7 @@ class CannotConnect(HomeAssistantError):
 
 class InvalidRegistersFile(HomeAssistantError):
     """Błąd sygnalizujący niepoprawny plik z mapą rejestrów."""
+
+
+class InvalidAppCodeError(HomeAssistantError):
+    """Błąd sygnalizujący niepoprawny kod aplikacji VTS."""

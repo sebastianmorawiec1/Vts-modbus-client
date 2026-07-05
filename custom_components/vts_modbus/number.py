@@ -11,6 +11,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import VTSModbusCoordinator
+from . import entry_slug
 
 
 async def async_setup_entry(
@@ -35,6 +36,7 @@ class VTSNumber(CoordinatorEntity[VTSModbusCoordinator], NumberEntity):
         reg = coordinator.registers[name]
 
         self._attr_unique_id = f"{entry.entry_id}_{name}"
+        self.entity_id = f"number.{entry_slug(entry)}_{name.lower()}"
         self._attr_translation_key = name
         self._attr_name = reg.description or name
         self._attr_native_unit_of_measurement = reg.unit or None

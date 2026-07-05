@@ -20,6 +20,12 @@ from .const import (
 from .coordinator import VTSModbusCoordinator
 from .registers import load_registers_from_yaml
 
+
+def entry_slug(entry: ConfigEntry) -> str:
+    """Stabilny prefiks entity_id na podstawie hosta, np. vts_192_168_1_60."""
+    host = str(entry.data.get(CONF_HOST, "vts")).lower()
+    return "vts_" + "".join(ch if ch.isalnum() else "_" for ch in host)
+
 # Domyślna mapa rejestrów: pełna mapa z oficjalnej dokumentacji VTS dla
 # modułu rozszerzeń Carel TCP/IP (sterowniki VS...uPC), dołączona do integracji.
 BUNDLED_REGISTERS_FILE = Path(__file__).parent / "registers_vts_carel_tcpip.yaml"
@@ -34,7 +40,28 @@ PLATFORMS: list[Platform] = [
 ]
 
 
+CARD_URL = "/vts_modbus/vts-ahu-card.js"
+_CARD_REGISTERED = False
+
+
+async def _register_card(hass: HomeAssistant) -> None:
+    """Serwuje karte Lovelace vts-ahu-card.js i dodaje ja do frontendu."""
+    global _CARD_REGISTERED
+    if _CARD_REGISTERED:
+        return
+    from homeassistant.components.http import StaticPathConfig
+    from homeassistant.components.frontend import add_extra_js_url
+
+    card_path = str(Path(__file__).parent / "vts-ahu-card.js")
+    await hass.http.async_register_static_paths(
+        [StaticPathConfig(CARD_URL, card_path, False)]
+    )
+    add_extra_js_url(hass, CARD_URL)
+    _CARD_REGISTERED = True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    await _register_card(hass)
     data = entry.data
 
     registers_file = data.get(CONF_REGISTERS_FILE) or str(BUNDLED_REGISTERS_FILE)
